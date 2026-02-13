@@ -13,6 +13,7 @@
 
 // MSP command codes
 #define MSP_SET_VTX_CONFIG      89
+#define MSP_ELRS_BIND           0x09
 
 // Maximum payload size
 #define MSP_MAX_PAYLOAD_SIZE    64

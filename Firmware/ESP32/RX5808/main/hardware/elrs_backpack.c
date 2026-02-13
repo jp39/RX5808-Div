@@ -1,5 +1,6 @@
 #include "elrs_backpack.h"
 #include "elrs_msp.h"
+#include "elrs_config.h"
 #include "rx5808.h"
 #include <string.h>
 #include "esp_log.h"
@@ -9,15 +10,23 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/timers.h"
 
 static const char *TAG = "ELRS_BP";
 
-// ELRS UID derived from binding phrase
-// Both TX and VRX set their MAC to this UID for ESP-NOW communication
-// Generate with: python3 generate_uid.py "your_binding_phrase"
-// IMPORTANT: This must match your ELRS binding phrase UID
-// The first byte MUST be even (unicast requirement)
-static const uint8_t elrs_uid[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+// Broadcast MAC address for binding mode
+static const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// Current UID (loaded from NVS or received during binding)
+static uint8_t elrs_uid[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// Binding state
+static elrs_bind_state_t binding_state = ELRS_STATE_UNBOUND;
+static elrs_bind_state_t previous_state = ELRS_STATE_UNBOUND;
+static uint8_t pending_uid[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static TimerHandle_t binding_timer = NULL;
+static uint32_t binding_timeout_ms = 0;
+static uint32_t binding_start_time = 0;
 
 // ESP-NOW message structure
 typedef struct {
@@ -32,6 +41,159 @@ static TaskHandle_t backpack_task_handle = NULL;
 
 // MSP parser instance
 static msp_parser_t msp_parser;
+
+// Forward declarations
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len);
+
+/**
+ * @brief Binding timeout timer callback
+ */
+static void binding_timeout_callback(TimerHandle_t xTimer) {
+    ESP_LOGW(TAG, "Binding timeout");
+    binding_state = ELRS_STATE_BIND_TIMEOUT;
+    // Timer will be deleted by the binding cancel function
+}
+
+/**
+ * @brief Reinitialize ESP-NOW with new UID
+ */
+static bool reinit_espnow_with_uid(const uint8_t uid[6]) {
+    esp_err_t ret;
+
+    ESP_LOGI(TAG, "Reinitializing with UID: %02X:%02X:%02X:%02X:%02X:%02X",
+             uid[0], uid[1], uid[2], uid[3], uid[4], uid[5]);
+
+    // Deinitialize ESP-NOW first
+    esp_now_deinit();
+
+    // Stop WiFi
+    ret = esp_wifi_stop();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to stop WiFi: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Deinitialize WiFi completely
+    ret = esp_wifi_deinit();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to deinit WiFi: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Re-initialize WiFi
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ret = esp_wifi_init(&cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init WiFi: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    ret = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set WiFi mode: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set WiFi storage: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Now set the MAC address (WiFi must be initialized but not started)
+    ret = esp_wifi_set_mac(WIFI_IF_STA, uid);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set MAC: %s", esp_err_to_name(ret));
+        // Try to recover by restarting with old settings
+        esp_wifi_start();
+        esp_now_init();
+        esp_now_register_recv_cb(espnow_recv_cb);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "MAC set to: %02X:%02X:%02X:%02X:%02X:%02X",
+             uid[0], uid[1], uid[2], uid[3], uid[4], uid[5]);
+
+    // Start WiFi
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start WiFi: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Set channel
+    ret = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set channel: %s", esp_err_to_name(ret));
+    }
+
+    // Reinitialize ESP-NOW
+    ret = esp_now_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init ESP-NOW: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Register receive callback again
+    ret = esp_now_register_recv_cb(espnow_recv_cb);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register recv callback: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Add new peer
+    esp_now_peer_info_t peer_info = {0};
+    memcpy(peer_info.peer_addr, uid, 6);
+    peer_info.channel = 1;
+    peer_info.ifidx = WIFI_IF_STA;
+    peer_info.encrypt = false;
+
+    ret = esp_now_add_peer(&peer_info);
+    if (ret != ESP_OK && ret != ESP_ERR_ESPNOW_EXIST) {
+        ESP_LOGE(TAG, "Failed to add peer: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    // Update current UID
+    memcpy(elrs_uid, uid, 6);
+
+    ESP_LOGI(TAG, "ESP-NOW reinitialized successfully");
+    return true;
+}
+
+/**
+ * @brief Complete the binding process
+ */
+static void complete_binding(void) {
+    // Save UID to NVS
+    if (!elrs_config_save_uid(pending_uid)) {
+        ESP_LOGE(TAG, "Failed to save UID to NVS");
+        binding_state = ELRS_STATE_BIND_TIMEOUT;
+        return;
+    }
+
+    // Stop binding timer
+    if (binding_timer != NULL) {
+        xTimerStop(binding_timer, 0);
+        xTimerDelete(binding_timer, 0);
+        binding_timer = NULL;
+    }
+
+    // Reinitialize ESP-NOW with new UID
+    if (!reinit_espnow_with_uid(pending_uid)) {
+        ESP_LOGE(TAG, "Failed to reinitialize ESP-NOW");
+        binding_state = ELRS_STATE_BIND_TIMEOUT;
+        return;
+    }
+
+    // Update state
+    binding_state = ELRS_STATE_BIND_SUCCESS;
+    ESP_LOGI(TAG, "Binding completed successfully");
+
+    // After a short delay, transition to BOUND state
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    binding_state = ELRS_STATE_BOUND;
+}
 
 /**
  * @brief Process MSP_SET_VTX_CONFIG command
@@ -179,6 +341,28 @@ static void process_msp_packet(msp_parser_t *parser) {
             handle_msp_set_vtx_config(parser->payload, parser->payload_size);
             break;
 
+        case MSP_ELRS_BIND:
+            ESP_LOGI(TAG, "Received MSP_ELRS_BIND packet");
+            if (binding_state == ELRS_STATE_BINDING && parser->payload_size >= 6) {
+                // Extract UID from payload
+                memcpy(pending_uid, parser->payload, 6);
+
+                // Validate UID (first byte must be even for unicast)
+                pending_uid[0] &= ~0x01;
+
+                ESP_LOGI(TAG, "Binding to UID: %02X:%02X:%02X:%02X:%02X:%02X",
+                         pending_uid[0], pending_uid[1], pending_uid[2],
+                         pending_uid[3], pending_uid[4], pending_uid[5]);
+
+                // Complete binding
+                complete_binding();
+            } else if (binding_state != ELRS_STATE_BINDING) {
+                ESP_LOGW(TAG, "Received bind packet but not in binding mode");
+            } else {
+                ESP_LOGW(TAG, "Bind packet too short: %d bytes", parser->payload_size);
+            }
+            break;
+
         default:
             ESP_LOGD(TAG, "Unhandled MSP function: 0x%04X", parser->function);
             break;
@@ -255,6 +439,19 @@ bool ELRS_Backpack_Init(void) {
         return false;
     }
 
+    // Try to load UID from NVS
+    if (elrs_config_load_uid(elrs_uid)) {
+        binding_state = ELRS_STATE_BOUND;
+        ESP_LOGI(TAG, "Loaded UID from NVS: %02X:%02X:%02X:%02X:%02X:%02X",
+                 elrs_uid[0], elrs_uid[1], elrs_uid[2],
+                 elrs_uid[3], elrs_uid[4], elrs_uid[5]);
+    } else {
+        binding_state = ELRS_STATE_UNBOUND;
+        ESP_LOGW(TAG, "No UID found in NVS - use UI to bind");
+        // Set to all zeros
+        memset(elrs_uid, 0, 6);
+    }
+
     // Initialize WiFi in STA mode
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -265,9 +462,9 @@ bool ELRS_Backpack_Init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
     // Set our MAC address to the UID (BEFORE starting WiFi)
-    // This matches the TX backpack behavior - both sides use the same UID as their MAC
+    // If unbound, use zeros (will be changed during binding)
     ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, elrs_uid));
-    ESP_LOGI(TAG, "MAC set to UID: %02X:%02X:%02X:%02X:%02X:%02X",
+    ESP_LOGI(TAG, "MAC set to: %02X:%02X:%02X:%02X:%02X:%02X",
              elrs_uid[0], elrs_uid[1], elrs_uid[2],
              elrs_uid[3], elrs_uid[4], elrs_uid[5]);
 
@@ -332,4 +529,148 @@ bool ELRS_Backpack_Init(void) {
 
     ESP_LOGI(TAG, "ELRS backpack initialized successfully");
     return true;
+}
+
+elrs_bind_state_t ELRS_Backpack_Get_State(void) {
+    return binding_state;
+}
+
+bool ELRS_Backpack_Start_Binding(uint32_t timeout_ms) {
+    if (binding_state == ELRS_STATE_BINDING) {
+        ESP_LOGW(TAG, "Already in binding mode");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Starting binding mode (timeout: %lu ms)", timeout_ms);
+
+    // Save previous state
+    previous_state = binding_state;
+    binding_state = ELRS_STATE_BINDING;
+    binding_timeout_ms = timeout_ms;
+    binding_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    // Add broadcast MAC as peer to receive broadcast bind packets
+    // We keep our own MAC unchanged
+    esp_now_peer_info_t peer_info = {0};
+    memcpy(peer_info.peer_addr, broadcast_mac, 6);
+    peer_info.channel = 1;
+    peer_info.ifidx = WIFI_IF_STA;
+    peer_info.encrypt = false;
+
+    esp_err_t ret = esp_now_add_peer(&peer_info);
+    if (ret != ESP_OK && ret != ESP_ERR_ESPNOW_EXIST) {
+        ESP_LOGE(TAG, "Failed to add broadcast peer: %s", esp_err_to_name(ret));
+        binding_state = previous_state;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Added broadcast peer for binding");
+
+    // Create binding timeout timer
+    binding_timer = xTimerCreate(
+        "binding_timer",
+        pdMS_TO_TICKS(timeout_ms),
+        pdFALSE,  // One-shot timer
+        NULL,
+        binding_timeout_callback
+    );
+
+    if (binding_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create binding timer");
+        // Remove broadcast peer
+        esp_now_del_peer(broadcast_mac);
+        binding_state = previous_state;
+        return false;
+    }
+
+    // Start timer
+    xTimerStart(binding_timer, 0);
+
+    ESP_LOGI(TAG, "Binding mode active - waiting for TX...");
+    return true;
+}
+
+void ELRS_Backpack_Cancel_Binding(void) {
+    if (binding_state != ELRS_STATE_BINDING) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Canceling binding mode");
+
+    // Stop and delete timer
+    if (binding_timer != NULL) {
+        xTimerStop(binding_timer, 0);
+        xTimerDelete(binding_timer, 0);
+        binding_timer = NULL;
+    }
+
+    // Remove broadcast peer
+    esp_now_del_peer(broadcast_mac);
+
+    // Restore previous state
+    binding_state = previous_state;
+
+    // If we were bound before, restore the UID peer
+    if (binding_state == ELRS_STATE_BOUND) {
+        uint8_t stored_uid[6];
+        if (elrs_config_load_uid(stored_uid)) {
+            // Add the bound UID as peer again (if not already present)
+            esp_now_peer_info_t peer_info = {0};
+            memcpy(peer_info.peer_addr, stored_uid, 6);
+            peer_info.channel = 1;
+            peer_info.ifidx = WIFI_IF_STA;
+            peer_info.encrypt = false;
+            esp_now_add_peer(&peer_info);
+        }
+    }
+
+    ESP_LOGI(TAG, "Binding canceled");
+}
+
+bool ELRS_Backpack_Is_Bound(void) {
+    return (binding_state == ELRS_STATE_BOUND || binding_state == ELRS_STATE_BIND_SUCCESS);
+}
+
+void ELRS_Backpack_Unbind(void) {
+    ESP_LOGI(TAG, "Unbinding from TX");
+
+    // Clear UID from NVS
+    elrs_config_clear_uid();
+
+    // Cancel binding if active
+    if (binding_state == ELRS_STATE_BINDING) {
+        ELRS_Backpack_Cancel_Binding();
+    }
+
+    // Set state to unbound
+    binding_state = ELRS_STATE_UNBOUND;
+
+    // Clear UID
+    memset(elrs_uid, 0, 6);
+
+    // Reinitialize with zeros (will need rebinding)
+    reinit_espnow_with_uid(elrs_uid);
+
+    ESP_LOGI(TAG, "Unbound successfully");
+}
+
+void ELRS_Backpack_Get_UID(uint8_t uid[6]) {
+    if (uid != NULL) {
+        memcpy(uid, elrs_uid, 6);
+    }
+}
+
+uint32_t ELRS_Backpack_Get_Binding_Timeout_Remaining(void) {
+    if (binding_state != ELRS_STATE_BINDING) {
+        return 0;
+    }
+
+    uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t elapsed = current_time - binding_start_time;
+
+    if (elapsed >= binding_timeout_ms) {
+        return 0;
+    }
+
+    return (binding_timeout_ms - elapsed) / 1000;  // Return seconds
 }
