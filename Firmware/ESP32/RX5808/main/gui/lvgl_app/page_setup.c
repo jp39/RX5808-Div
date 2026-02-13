@@ -8,6 +8,8 @@
 #include "rx5808.h"
 #include "lvgl_stl.h"
 #include "lv_port_disp.h"
+#include "elrs_backpack.h"
+#include "hwvers.h"
 
 LV_FONT_DECLARE(lv_font_chinese_12);
 
@@ -27,6 +29,8 @@ static lv_obj_t* beep_label;
 static lv_obj_t* osd_format_label;
 static lv_obj_t* language_label;
 static lv_obj_t* signal_source_label;
+static lv_obj_t* elrs_bind_label;
+static lv_obj_t* elrs_status_label;
 static lv_obj_t* exit_label;
 static lv_obj_t* back_light_bar;
 static lv_obj_t* fan_speed_bar;
@@ -35,6 +39,8 @@ static lv_obj_t* beep_switch;
 static lv_obj_t* osd_format_setup_label;
 static lv_obj_t* language_setup_label;
 static lv_obj_t* signal_source_setup_label;
+static lv_obj_t* elrs_bind_button_label;
+static lv_obj_t* elrs_status_value_label;
 
 const char language_label_text[][10] = { "English","中文" };
 const char osd_format_label_text[][5] = { "PAL","NTSC" };
@@ -55,9 +61,63 @@ static int8_t setup_fan_speed;
 static bool  boot_animation_state;
 static bool  beep_state;
 
+#ifdef ELRS_BACKPACK_ENABLE
+static lv_timer_t* elrs_status_timer = NULL;
+static elrs_bind_state_t last_elrs_state = ELRS_STATE_UNBOUND;
+#endif
+
 static void page_setup_exit(void);
 static void page_setup_style_deinit(void);
 static void page_setup_set_language(uint16_t language);
+
+#ifdef ELRS_BACKPACK_ENABLE
+static void elrs_status_update(lv_timer_t* timer)
+{
+    (void)timer;
+
+    elrs_bind_state_t state = ELRS_Backpack_Get_State();
+
+    // Update status only if changed
+    if (state != last_elrs_state) {
+        last_elrs_state = state;
+
+        switch (state) {
+            case ELRS_STATE_UNBOUND:
+                lv_label_set_text(elrs_status_value_label, "Unbound");
+                lv_label_set_text(elrs_bind_button_label, "BIND");
+                break;
+
+            case ELRS_STATE_BOUND:
+                lv_label_set_text(elrs_status_value_label, "Bound");
+                lv_label_set_text(elrs_bind_button_label, "UNBIND");
+                break;
+
+            case ELRS_STATE_BINDING: {
+                uint32_t remaining = ELRS_Backpack_Get_Binding_Timeout_Remaining();
+                lv_label_set_text_fmt(elrs_status_value_label, "%lus", remaining);
+                lv_label_set_text(elrs_bind_button_label, "CANCEL");
+                break;
+            }
+
+            case ELRS_STATE_BIND_SUCCESS:
+                lv_label_set_text(elrs_status_value_label, "Success!");
+                lv_label_set_text(elrs_bind_button_label, "UNBIND");
+                break;
+
+            case ELRS_STATE_BIND_TIMEOUT:
+                lv_label_set_text(elrs_status_value_label, "Timeout");
+                lv_label_set_text(elrs_bind_button_label, "BIND");
+                break;
+        }
+    }
+
+    // Update countdown during binding
+    if (state == ELRS_STATE_BINDING) {
+        uint32_t remaining = ELRS_Backpack_Get_Binding_Timeout_Remaining();
+        lv_label_set_text_fmt(elrs_status_value_label, "%lus", remaining);
+    }
+}
+#endif
 
 static void setup_event_callback(lv_event_t* event)
 {
@@ -97,6 +157,22 @@ static void setup_event_callback(lv_event_t* event)
                 else
                     lv_obj_add_state(beep_switch, LV_STATE_CHECKED);
             }
+#ifdef ELRS_BACKPACK_ENABLE
+            else if (obj == elrs_bind_label)
+            {
+                elrs_bind_state_t state = ELRS_Backpack_Get_State();
+                if (state == ELRS_STATE_BINDING) {
+                    // Cancel binding
+                    ELRS_Backpack_Cancel_Binding();
+                } else if (state == ELRS_STATE_BOUND || state == ELRS_STATE_BIND_SUCCESS) {
+                    // Unbind
+                    ELRS_Backpack_Unbind();
+                } else {
+                    // Start binding (30 second timeout)
+                    ELRS_Backpack_Start_Binding(30000);
+                }
+            }
+#endif
         }
         else if (key_status == LV_KEY_LEFT) {
             if (obj == back_light_label)
@@ -260,6 +336,10 @@ static void page_setup_set_language(uint16_t language)
         lv_obj_set_style_text_font(osd_format_label, &lv_font_montserrat_12, LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(language_label, &lv_font_montserrat_12, LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(signal_source_label, &lv_font_montserrat_12, LV_STATE_DEFAULT);
+#ifdef ELRS_BACKPACK_ENABLE
+        lv_obj_set_style_text_font(elrs_bind_label, &lv_font_montserrat_12, LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(elrs_status_label, &lv_font_montserrat_12, LV_STATE_DEFAULT);
+#endif
         lv_obj_set_style_text_font(exit_label, &lv_font_montserrat_12, LV_STATE_DEFAULT);
         lv_label_set_text_fmt(back_light_label, "BackLight");
         lv_label_set_text_fmt(fan_speed_label, "FanSpeed ");
@@ -268,6 +348,10 @@ static void page_setup_set_language(uint16_t language)
         lv_label_set_text_fmt(osd_format_label, "OSD Type");
         lv_label_set_text_fmt(language_label, "Language");
         lv_label_set_text_fmt(signal_source_label, "Signal");
+#ifdef ELRS_BACKPACK_ENABLE
+        lv_label_set_text_fmt(elrs_bind_label, "ELRS");
+        lv_label_set_text_fmt(elrs_status_label, "Status");
+#endif
         lv_label_set_text_fmt(exit_label, "Save&Exit");
         lv_label_set_text_fmt(osd_format_setup_label, (const char*)(&osd_format_label_text[osd_format_selid % 2]));
         lv_label_set_text_fmt(language_setup_label, (const char*)(&language_label_text[language_selid % 2]));
@@ -282,6 +366,10 @@ static void page_setup_set_language(uint16_t language)
         lv_obj_set_style_text_font(osd_format_label, &lv_font_chinese_12, LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(language_label, &lv_font_chinese_12, LV_STATE_DEFAULT);
         lv_obj_set_style_text_font(signal_source_label, &lv_font_chinese_12, LV_STATE_DEFAULT);
+#ifdef ELRS_BACKPACK_ENABLE
+        lv_obj_set_style_text_font(elrs_bind_label, &lv_font_montserrat_12, LV_STATE_DEFAULT);
+        lv_obj_set_style_text_font(elrs_status_label, &lv_font_chinese_12, LV_STATE_DEFAULT);
+#endif
         lv_obj_set_style_text_font(exit_label, &lv_font_chinese_12, LV_STATE_DEFAULT);
         lv_label_set_text_fmt(back_light_label, "屏幕背光 ");
         lv_label_set_text_fmt(fan_speed_label, "风扇转速 ");
@@ -290,6 +378,10 @@ static void page_setup_set_language(uint16_t language)
         lv_label_set_text_fmt(osd_format_label, "OSD制式");
         lv_label_set_text_fmt(language_label, "系统语言 ");
         lv_label_set_text_fmt(signal_source_label, "输出信号源 ");
+#ifdef ELRS_BACKPACK_ENABLE
+        lv_label_set_text_fmt(elrs_bind_label, "ELRS");
+        lv_label_set_text_fmt(elrs_status_label, "状态 ");
+#endif
         lv_label_set_text_fmt(exit_label, "保存并退出 ");
         lv_label_set_text_fmt(osd_format_setup_label, (const char*)(&osd_format_label_text[osd_format_selid % 2]));
         lv_label_set_text_fmt(language_setup_label, (const char*)(&language_label_text[language_selid % 2]));
@@ -434,11 +526,53 @@ void page_setup_create()
     lv_obj_set_size(signal_source_setup_label, 50, 18);
     lv_label_set_long_mode(signal_source_setup_label, LV_LABEL_LONG_WRAP);
 
+#ifdef ELRS_BACKPACK_ENABLE
+    // ELRS Bind button
+    elrs_bind_label = lv_label_create(menu_setup_contain);
+    lv_obj_add_style(elrs_bind_label, &style_label, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(elrs_bind_label, LABEL_FOCUSE_COLOR, LV_STATE_FOCUSED);
+    lv_label_set_text(elrs_bind_label, "ELRS");
+    lv_obj_set_pos(elrs_bind_label, 0, 135);
+    lv_obj_set_size(elrs_bind_label, 75, 20);
+    lv_label_set_long_mode(elrs_bind_label, LV_LABEL_LONG_WRAP);
+
+    elrs_bind_button_label = lv_label_create(menu_setup_contain);
+    lv_obj_add_style(elrs_bind_button_label, &style_setup_item, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(elrs_bind_button_label, LABEL_FOCUSE_COLOR, LV_STATE_FOCUSED);
+    lv_label_set_text(elrs_bind_button_label, "BIND");
+    lv_obj_set_pos(elrs_bind_button_label, 110, 135);
+    lv_obj_set_size(elrs_bind_button_label, 50, 18);
+    lv_label_set_long_mode(elrs_bind_button_label, LV_LABEL_LONG_WRAP);
+
+    // ELRS Status display
+    elrs_status_label = lv_label_create(menu_setup_contain);
+    lv_obj_add_style(elrs_status_label, &style_label, LV_STATE_DEFAULT);
+    lv_label_set_text(elrs_status_label, "Status");
+    lv_obj_set_pos(elrs_status_label, 0, 154);
+    lv_obj_set_size(elrs_status_label, 75, 20);
+    lv_label_set_long_mode(elrs_status_label, LV_LABEL_LONG_WRAP);
+
+    elrs_status_value_label = lv_label_create(menu_setup_contain);
+    lv_obj_add_style(elrs_status_value_label, &style_setup_item, LV_STATE_DEFAULT);
+    if (ELRS_Backpack_Is_Bound()) {
+        lv_label_set_text(elrs_status_value_label, "Bound");
+    } else {
+        lv_label_set_text(elrs_status_value_label, "Unbound");
+    }
+    lv_obj_set_pos(elrs_status_value_label, 110, 154);
+    lv_obj_set_size(elrs_status_value_label, 50, 18);
+    lv_label_set_long_mode(elrs_status_value_label, LV_LABEL_LONG_CLIP);
+#endif
+
     exit_label = lv_label_create(menu_setup_contain);
     lv_obj_add_style(exit_label, &style_label, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(exit_label, LABEL_FOCUSE_COLOR, LV_STATE_FOCUSED);
     //lv_label_set_text_fmt(exit_label, "SAVE&EXIT");
+#ifdef ELRS_BACKPACK_ENABLE
+    lv_obj_set_pos(exit_label, 0, 173);
+#else
     lv_obj_set_pos(exit_label, 0, 135);
+#endif
     lv_obj_set_size(exit_label, 75, 20);
     lv_label_set_long_mode(exit_label, LV_LABEL_LONG_WRAP);
 
@@ -453,6 +587,9 @@ void page_setup_create()
     lv_obj_add_event_cb(osd_format_label, setup_event_callback, LV_EVENT_KEY, NULL);
     lv_obj_add_event_cb(language_label, setup_event_callback, LV_EVENT_KEY, NULL);
     lv_obj_add_event_cb(signal_source_label, setup_event_callback, LV_EVENT_KEY, NULL);
+#ifdef ELRS_BACKPACK_ENABLE
+    lv_obj_add_event_cb(elrs_bind_label, setup_event_callback, LV_EVENT_KEY, NULL);
+#endif
     lv_obj_add_event_cb(exit_label, setup_event_callback, LV_EVENT_KEY, NULL);
 
     lv_group_add_obj(setup_group, back_light_label);
@@ -462,6 +599,9 @@ void page_setup_create()
     lv_group_add_obj(setup_group, osd_format_label);
     lv_group_add_obj(setup_group, language_label);
     lv_group_add_obj(setup_group, signal_source_label);
+#ifdef ELRS_BACKPACK_ENABLE
+    lv_group_add_obj(setup_group, elrs_bind_label);
+#endif
     lv_group_add_obj(setup_group, exit_label);
     lv_group_set_editing(setup_group, true);
 
@@ -478,7 +618,13 @@ void page_setup_create()
     lv_amin_start(osd_format_label, -100, 0, 1, 150, 200, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
     lv_amin_start(language_label, -100, 0, 1, 150, 250, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
     lv_amin_start(signal_source_label, -100, 0, 1, 150, 300, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#ifdef ELRS_BACKPACK_ENABLE
+    lv_amin_start(elrs_bind_label, -100, 0, 1, 150, 350, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+    lv_amin_start(elrs_status_label, -100, 0, 1, 150, 400, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+    lv_amin_start(exit_label, -100, 0, 1, 150, 450, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#else
     lv_amin_start(exit_label, -100, 0, 1, 150, 350, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#endif
 
     lv_amin_start(back_light_bar, 160, 110, 1, 150, 0, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
     lv_amin_start(fan_speed_bar, 160, 110, 1, 150, 50, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
@@ -488,11 +634,28 @@ void page_setup_create()
     lv_amin_start(language_setup_label, 160, 110, 1, 150, 250, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
     lv_amin_start(signal_source_setup_label, 160, 110, 1, 150, 300, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
 
+#ifdef ELRS_BACKPACK_ENABLE
+    lv_amin_start(elrs_bind_button_label, 160, 110, 1, 150, 350, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+    lv_amin_start(elrs_status_value_label, 160, 110, 1, 150, 400, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+
+    // Start ELRS status update timer (500ms interval)
+    elrs_status_timer = lv_timer_create(elrs_status_update, 500, NULL);
+    last_elrs_state = ELRS_Backpack_Get_State();
+#endif
+
 }
 
 
 static void page_setup_exit()
 {
+#ifdef ELRS_BACKPACK_ENABLE
+    // Delete ELRS status timer
+    if (elrs_status_timer != NULL) {
+        lv_timer_del(elrs_status_timer);
+        elrs_status_timer = NULL;
+    }
+#endif
+
     lv_amin_start(back_light_label, lv_obj_get_x(back_light_label), -100, 1, 200, 0, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_leave);
     lv_amin_start(fan_speed_label, lv_obj_get_x(fan_speed_label), -100, 1, 200, 50, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_leave);
     lv_amin_start(boot_animation_label, lv_obj_get_x(boot_animation_label), -100, 1, 200, 100, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_leave);
@@ -500,7 +663,13 @@ static void page_setup_exit()
     lv_amin_start(osd_format_label, lv_obj_get_x(osd_format_label), -100, 1, 200, 200, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_leave);
     lv_amin_start(language_label, lv_obj_get_x(language_label), -100, 1, 200, 250, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_leave);
     lv_amin_start(signal_source_label, lv_obj_get_x(signal_source_label), -100, 1, 200, 300, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#ifdef ELRS_BACKPACK_ENABLE
+    lv_amin_start(elrs_bind_label, lv_obj_get_x(elrs_bind_label), -100, 1, 200, 350, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+    lv_amin_start(elrs_status_label, lv_obj_get_x(elrs_status_label), -100, 1, 200, 400, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+    lv_amin_start(exit_label, lv_obj_get_x(exit_label), -100, 1, 200, 450, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#else
     lv_amin_start(exit_label, lv_obj_get_x(exit_label), -100, 1, 200, 350, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#endif
 
     lv_amin_start(back_light_bar, lv_obj_get_x(back_light_bar), 160, 1, 200, 0, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_leave);
     lv_amin_start(fan_speed_bar, lv_obj_get_x(fan_speed_bar), 160, 1, 200, 50, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_leave);
@@ -509,6 +678,10 @@ static void page_setup_exit()
     lv_amin_start(osd_format_setup_label, lv_obj_get_x(osd_format_setup_label), 160, 1, 200, 200, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
     lv_amin_start(language_setup_label, lv_obj_get_x(language_setup_label), 160, 1, 200, 250, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
     lv_amin_start(signal_source_setup_label, lv_obj_get_x(signal_source_setup_label), 160, 1, 200, 300, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#ifdef ELRS_BACKPACK_ENABLE
+    lv_amin_start(elrs_bind_button_label, lv_obj_get_x(elrs_bind_button_label), 160, 1, 200, 350, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+    lv_amin_start(elrs_status_value_label, lv_obj_get_x(elrs_status_value_label), 160, 1, 200, 400, (lv_anim_exec_xcb_t)lv_obj_set_x, page_setup_anim_enter);
+#endif
 
     lv_fun_delayed(page_setup_style_deinit, 500);
     lv_group_del(setup_group);
