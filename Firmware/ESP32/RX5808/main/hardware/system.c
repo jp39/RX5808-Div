@@ -15,6 +15,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#ifdef ELRS_BACKPACK_ENABLE
+#include "elrs_backpack.h"
+#endif
+
 
 void create_cpu_stack_monitor_task();
 void cpu_stack_monitor_task(void *param);
@@ -83,10 +87,16 @@ void system_init(void)
 	//printf("led init success!\n"); 	
  	Beep_Init();
 	//printf("beep init success!\n");
-    timer_init();  
-	//printf("timer init success!\n");	
+    timer_init();
+	//printf("timer init success!\n");
     RX5808_Init();
 	//printf("RX5808 init success!\n");
+
+#ifdef ELRS_BACKPACK_ENABLE
+	ELRS_Backpack_Init();
+	//printf("ELRS backpack init success!\n");
+#endif
+
 	//ws2812_init();
 	//printf("ws2812 init success!\n");
 	//while(1);

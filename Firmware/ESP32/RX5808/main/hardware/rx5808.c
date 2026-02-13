@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "hwvers.h"
 
 
@@ -32,6 +33,9 @@ bool RX5808_Shutdown = false;
 //uint16_t adc_convert_temp0[32][3];
 //uint16_t adc_convert_temp1[32][3];
 uint16_t adc_converted_value[3]={1024,1024,1024};
+
+// Mutex for thread-safe channel changes
+SemaphoreHandle_t rx5808_channel_mutex = NULL;
 
 volatile int8_t channel_count = 0;
 volatile int8_t Chx_count = 0;
@@ -120,17 +124,19 @@ void RX5808_RSSI_ADC_Init()
 
 void RX5808_Init()
 {
+	// Create mutex for thread-safe channel changes
+	rx5808_channel_mutex = xSemaphoreCreateMutex();
 
-    gpio_set_direction(RX5808_SCLK, GPIO_MODE_OUTPUT);	
-	gpio_set_direction(RX5808_MOSI, GPIO_MODE_OUTPUT);	
-	gpio_set_direction(RX5808_CS, GPIO_MODE_OUTPUT);	
+    gpio_set_direction(RX5808_SCLK, GPIO_MODE_OUTPUT);
+	gpio_set_direction(RX5808_MOSI, GPIO_MODE_OUTPUT);
+	gpio_set_direction(RX5808_CS, GPIO_MODE_OUTPUT);
 	gpio_set_direction(RX5808_SWITCH0, GPIO_MODE_OUTPUT);
-	gpio_reset_pin(RX5808_SWITCH1);	
-	gpio_set_direction(RX5808_SWITCH1, GPIO_MODE_OUTPUT);	
+	gpio_reset_pin(RX5808_SWITCH1);
+	gpio_set_direction(RX5808_SWITCH1, GPIO_MODE_OUTPUT);
 
 	gpio_set_level(RX5808_SWITCH0, 1);
 	gpio_set_level(RX5808_SWITCH1, 0);
-	
+
 	Send_Register_Data(Synthesizer_Register_A,0x00008);
 
 	Send_Register_Data(Power_Down_Control_Register,0x10DF3);
@@ -208,9 +214,22 @@ void Rx5808_Set_Channel(uint8_t ch)
 {
 	if(ch>47)
 		return ;
-    Rx5808_channel=ch;
+
+	// Thread-safe channel change with mutex
+	if (rx5808_channel_mutex != NULL) {
+		xSemaphoreTake(rx5808_channel_mutex, portMAX_DELAY);
+	}
+
+	Rx5808_channel=ch;
 	Chx_count=Rx5808_channel/8;
 	channel_count=Rx5808_channel%8;
+
+	// Actually tune the RX5808 to the new frequency
+	RX5808_Set_Freq(Rx5808_Freq[Chx_count][channel_count]);
+
+	if (rx5808_channel_mutex != NULL) {
+		xSemaphoreGive(rx5808_channel_mutex);
+	}
 }
 
 void RX5808_Set_RSSI_Ad_Min0(uint16_t value)

@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "hardware/hwvers.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 
 typedef enum
@@ -18,6 +20,7 @@ extern const uint16_t Rx5808_Freq[6][8];
 extern volatile int8_t channel_count;
 extern volatile int8_t Chx_count;
 extern uint16_t adc_converted_value[3];
+extern SemaphoreHandle_t rx5808_channel_mutex;
 void RX5808_RSSI_ADC_Init(void);
 void RX5808_Init(void);
 void RX5808_Pause(void);  

@@ -123,6 +123,20 @@ static void event_callback(lv_event_t* event)
 
 static void page_main_update(lv_timer_t* tmr)
 {
+    // Check for remote channel changes (e.g., from ELRS backpack)
+    static uint8_t last_channel = 0xFF;  // Initialize to invalid value
+    uint8_t current_channel = Rx5808_Get_Channel();
+
+    if (current_channel != last_channel && current_channel <= 47) {
+        // Channel changed remotely - update display
+        last_channel = current_channel;
+        uint8_t band = current_channel / 8;
+        uint8_t chan = current_channel % 8;
+
+        fre_label_update(band, chan);
+        lv_label_set_text_fmt(lv_channel_label, "%c%d", Rx5808_ChxMap[band], chan + 1);
+    }
+
     int rssi0 = (int)Rx5808_Get_Precentage0();
     int rssi1 = (int)Rx5808_Get_Precentage1();
     if (RX5808_Get_Signal_Source() == 0)

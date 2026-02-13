@@ -10,6 +10,9 @@
 #define D0WDQ6_VER
 #define SPI_LOW_SPEED
 
+// ELRS Backpack Support (comment out to disable)
+#define ELRS_BACKPACK_ENABLE
+
 
 #define SPI_HOST_USER    HSPI_HOST
 
